@@ -717,3 +717,23 @@ pub mod console {
         (n > 0).then(|| buf[..n as usize].to_vec())
     }
 }
+
+/// Files a process has open (`lsof`; empty when it can't tell).
+pub fn open_files(pid: i32) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("lsof").args(["-Fn", "-p", &pid.to_string()]).output() else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.strip_prefix('n')).map(String::from).collect()
+}
+
+/// One variable from a process's launch environment; nothing else is kept.
+pub fn env_var(pid: i32, name: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let env = crate::foreground::procargs(pid)?.1;
+    #[cfg(not(target_os = "macos"))]
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{name}=");
+    env.split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(prefix.as_bytes()))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+}

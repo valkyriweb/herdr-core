@@ -215,7 +215,9 @@ paths start at your current folder. Prefer explicit paths for remote work.
   connections. Host displays (including SSH forwarding) stay as they are.
   A missing `XAUTHORITY` file does not remove a display.
 - `hc keep <t>` (or `run --keep`) replaces a lost program with a shell,
-  never reruns a task. `hc keep <t> --off` disables recovery. Signal death
+  never reruns a task. With `resume_agents = true` in the config, a kept
+  terminal last running pi, pii, Claude Code or Codex gets a shell that
+  reopens the same session (same cwd, model) first. `hc keep <t> --off` disables recovery. Signal death
   without an exit code is loss too. After a grace delay, recovery runs on
   every OS, including after a host shutdown. On macOS, shutdown warnings
   preserve kept programs even if they catch a signal and exit with a code;

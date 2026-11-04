@@ -657,6 +657,44 @@
         ],
         "type": "object"
       },
+      "Resume": {
+        "description": "How to reopen the agent session last seen in a terminal.",
+        "properties": {
+          "argv": {
+            "description": "The command that reopens the session.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "description": "Where it runs.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pid": {
+            "description": "The agent process it was read from, and that process's name.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "turn": {
+            "description": "The terminal's turn when it was read.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "argv",
+          "cwd",
+          "pid",
+          "name",
+          "turn"
+        ],
+        "type": "object"
+      },
       "RunResult": {
         "properties": {
           "address": {
