@@ -441,10 +441,15 @@ impl crate::runtime::Core {
                     let fg = t.foreground.as_ref().filter(|f| !SHELLS.contains(&base(&f.name)))?;
                     let app = t.status.as_ref().map(|s| s.app.clone()).filter(|a| !a.is_empty())?;
                     let fresh = t.resume.as_ref().is_some_and(|r| r.turn == t.turn && r.pid == fg.pid);
-                    if fresh || t.resume_tried == Some((t.turn, fg.pid)) {
+                    // A failed read is retried every 5 s while the same process holds the turn
+                    // (its session file may not exist yet).
+                    let tried = t.resume_tried.is_some_and(|(turn, pid, at)| {
+                        turn == t.turn && pid == fg.pid && now.saturating_sub(at) < 5_000
+                    });
+                    if fresh || tried {
                         return None;
                     }
-                    t.resume_tried = Some((t.turn, fg.pid));
+                    t.resume_tried = Some((t.turn, fg.pid, now));
                     Some((t.id(), t.turn, app, t.argv.clone(), fg.clone(), t.labels.clone()))
                 })
                 .collect::<Vec<_>>();
@@ -471,9 +476,14 @@ impl crate::runtime::Core {
             });
             let Ok((Some(argv), fg)) = read.await else { continue };
             let mut st = self.lock();
-            let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live()) else { continue };
+            // Only if the agent it was read from still holds the same turn.
+            let same = |t: &&mut crate::terminals::Terminal| {
+                t.is_live() && t.turn == turn && t.foreground.as_ref().is_some_and(|f| f.pid == fg.pid)
+            };
+            let Some(t) = st.reg.terminals.get_mut(&id).filter(same) else { continue };
             t.resume = Some(Resume { argv, cwd: fg.cwd, pid: fg.pid, name: fg.name, turn });
             t.resume_lost_ms = None;
+            t.resume_tried = None;
             self.save_soon();
         }
     }

@@ -145,10 +145,10 @@ pub struct Terminal {
     #[serde(skip)]
     #[schemars(skip)]
     pub resume_lost_ms: Option<u64>,
-    /// The turn and process last read without finding a session (private, not kept).
+    /// The turn, process and time of the last read (private, not kept).
     #[serde(skip)]
     #[schemars(skip)]
-    pub resume_tried: Option<(u64, i32)>,
+    pub resume_tried: Option<(u64, i32, u64)>,
 }
 
 impl Terminal {
