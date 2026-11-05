@@ -138,6 +138,17 @@ pub struct Terminal {
     /// Machines (core ids) it started work on: they may call back to it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub afar: std::collections::BTreeSet<String>,
+    /// How to reopen the agent session last seen here (`resume_agents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<crate::resume::Resume>,
+    /// Since when another program holds the foreground (private, not kept).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resume_lost_ms: Option<u64>,
+    /// The turn, process and time of the last read (private, not kept).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resume_tried: Option<(u64, i32, u64)>,
 }
 
 impl Terminal {
@@ -303,6 +314,9 @@ impl Registry {
                 paste_gap_ms: new.template.as_ref().and_then(|t| t.paste_gap_ms),
                 foreground: None,
                 afar: Default::default(),
+                resume: None,
+                resume_lost_ms: None,
+                resume_tried: None,
                 template: new.template.map(|t| t.name),
                 first_message: None,
                 holder: None,
@@ -421,6 +435,7 @@ const PRIVATE: &[&str] = &[
     "restart_after_ms",
     "restart_delay_ms",
     "program_started_ms",
+    "resume",
 ];
 
 /// A terminal as clients see it (API results, events): its facts, without

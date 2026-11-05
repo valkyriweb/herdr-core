@@ -52,7 +52,9 @@ impl Core {
             eprintln!("core: kept terminals waiting for a holder: {e}");
             return;
         }
-        let shell = match crate::config::load(&self.paths.config).and_then(|settings| settings.shell()) {
+        let config = crate::config::load(&self.paths.config);
+        let resume_agents = config.as_ref().is_ok_and(|c| c.resume_agents == Some(true));
+        let shell = match config.and_then(|settings| settings.shell()) {
             Ok(shell) => shell,
             Err(e) => {
                 eprintln!("core: kept terminals waiting for a shell: {}", e.message);
@@ -80,6 +82,12 @@ impl Core {
             let instance = holder.instance.clone();
             let t = st.reg.terminals.get_mut(&id).expect("pending");
             let env = crate::api::child_env(base_env.clone(), t.restart_env.clone());
+            // An agent seen here reopens its session in the shell; anything else gets the bare shell.
+            let resume = t
+                .resume
+                .as_ref()
+                .filter(|r| resume_agents && std::path::Path::new(&r.cwd).is_dir())
+                .and_then(|r| Some((crate::resume::launch(&shell, &r.argv)?, r.cwd.clone())));
             let cwd = t
                 .last_cwd
                 .as_ref()
@@ -92,7 +100,8 @@ impl Core {
             let (env, scope) = crate::api::terminal_env(&self, id, &cwd, env);
             t.scope = Some(scope);
             t.holder = Some(instance);
-            t.argv = shell.clone();
+            let cwd = resume.as_ref().map_or(cwd, |(_, at)| at.clone());
+            t.argv = resume.map_or_else(|| shell.clone(), |(argv, _)| argv);
             t.cwd = cwd.clone();
             t.template = None;
             t.reported = false;

@@ -27,6 +27,9 @@ pub struct Config {
     /// timeout on top), and to send anything at all before its line is
     /// given up and dialed again (default 30).
     pub machine_timeout: Option<f64>,
+    /// Kept terminals running pi, pii, Claude Code or Codex reopen the same
+    /// session after a restart, instead of a bare shell (default off).
+    pub resume_agents: Option<bool>,
 }
 
 impl Config {
