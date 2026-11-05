@@ -12,7 +12,12 @@ impl Lookup for Fake {
     }
     fn newest(&self, dir: &Path) -> Option<String> {
         let dir = format!("{}/", dir.display());
-        self.files.keys().filter(|k| k.starts_with(&dir)).max().map(|k| base(k).trim_end_matches(".jsonl").into())
+        self.files.keys().filter(|k| k.starts_with(&dir)).max().cloned()
+    }
+    /// Files sort by name in write order.
+    fn modified(&self, path: &Path) -> Option<std::time::SystemTime> {
+        let rank = self.files.keys().position(|k| *k == path.display().to_string())?;
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(rank as u64))
     }
     fn read(&self, path: &Path) -> Option<String> {
         self.files.get(&path.display().to_string()).cloned()
@@ -39,10 +44,33 @@ fn v(s: &str) -> Vec<String> {
 }
 
 fn run(app: &str, argv: &str, fg: &str, look: &Fake) -> Option<String> {
+    run_in(app, argv, fg, look, false)
+}
+
+fn run_in(app: &str, argv: &str, fg: &str, look: &Fake, shared_cwd: bool) -> Option<String> {
     let labels = BTreeMap::new();
     let (argv, fg) = (v(argv), v(fg));
-    let f = Facts { app, argv: &argv, fg_argv: &fg, cwd: "/w/p", pid: 7, labels: &labels, agent_dir: None };
+    let f = Facts { app, argv: &argv, fg_argv: &fg, cwd: "/w/p", pid: 7, labels: &labels, agent_dir: None, shared_cwd };
     plan(&f, look).map(|a| a.join(" "))
+}
+
+#[test]
+fn pi_follows_a_session_switch_after_resuming() {
+    let mut look = Fake::default();
+    look.files.insert("/h/.pi/agent/sessions/--w-p--/1_old.jsonl".into(), String::new());
+    assert_eq!(run("pi", "pi --session old", "pi", &look).as_deref(), Some("pi --session old"));
+    look.files.insert("/h/.pi/agent/sessions/--w-p--/2_new.jsonl".into(), String::new());
+    let (old, new) = ("/h/.pi/agent/sessions/--w-p--/1_old.jsonl", "/h/.pi/agent/sessions/--w-p--/2_new.jsonl");
+    assert_eq!(run("pi", "pi --session old", "pi", &look), Some(format!("pi --session {new}")));
+    assert_eq!(run("pi", &format!("pi --session {old}"), "pi", &look), Some(format!("pi --session {new}")));
+}
+
+#[test]
+fn pi_never_guesses_when_another_agent_shares_the_cwd() {
+    let mut look = Fake::default();
+    look.files.insert("/h/.pi/agent/sessions/--w-p--/b.jsonl".into(), String::new());
+    assert_eq!(run_in("pi", "pi", "pi", &look, true), None);
+    assert_eq!(run_in("pi", "pi --session-id s", "pi", &look, true).as_deref(), Some("pi --session s"));
 }
 
 const SID: &str = "019a2b3c-4d5e-6f70-8192-a3b4c5d6e7f8";
@@ -53,7 +81,8 @@ fn pi_reopens_its_newest_session_in_the_cwd_and_keeps_its_model() {
     look.files.insert("/h/.pi/agent/sessions/--w-p--/2026_a.jsonl".into(), String::new());
     look.files.insert("/h/.pi/agent/sessions/--w-p--/2026_b.jsonl".into(), String::new());
     let got = run("pi", "pi --model opus --thinking high fix the bug", "pi", &look);
-    assert_eq!(got.as_deref(), Some("pi --session 2026_b --model opus --thinking high"));
+    let b = "/h/.pi/agent/sessions/--w-p--/2026_b.jsonl";
+    assert_eq!(got, Some(format!("pi --session {b} --model opus --thinking high")));
     assert_eq!(run("pi", "pi --session-id abc", "pi", &look).as_deref(), Some("pi --session abc"));
 }
 
@@ -61,7 +90,10 @@ fn pi_reopens_its_newest_session_in_the_cwd_and_keeps_its_model() {
 fn pii_is_told_apart_from_pi() {
     let mut look = Fake::default();
     look.files.insert("/h/.pi/pii/sessions/--w-p--/x.jsonl".into(), String::new());
-    assert_eq!(run("pi", "zsh -c | exec pii", "node", &look).as_deref(), Some("pii --session x"));
+    assert_eq!(
+        run("pi", "zsh -c | exec pii", "node", &look).as_deref(),
+        Some("pii --session /h/.pi/pii/sessions/--w-p--/x.jsonl")
+    );
 }
 
 #[test]

@@ -37,12 +37,16 @@ pub struct Facts<'a> {
     pub labels: &'a BTreeMap<String, String>,
     /// `PI_CODING_AGENT_DIR` from the agent's environment, when it has one.
     pub agent_dir: Option<String>,
+    /// Another live terminal runs pi in the same cwd: never guess a session from the folder.
+    pub shared_cwd: bool,
 }
 
 pub trait Lookup {
     fn home(&self) -> PathBuf;
     /// The most recently written session file in a pi sessions folder for this cwd.
     fn newest(&self, dir: &Path) -> Option<String>;
+    /// When a file was last written.
+    fn modified(&self, path: &Path) -> Option<std::time::SystemTime>;
     fn read(&self, path: &Path) -> Option<String>;
     /// Files this process has open.
     fn open_files(&self, pid: i32) -> Vec<String>;
@@ -259,16 +263,31 @@ pub fn plan(f: &Facts, look: &impl Lookup) -> Option<Vec<String>> {
                 kind = "pii";
             }
             let opts = options(kind, toks);
-            let sid = flag(&opts, &["--session-id", "--session"])
-                .or_else(|| f.labels.get("harbor.harness-session-id").cloned())
-                .or_else(|| {
-                    let dir = f
-                        .agent_dir
-                        .clone()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| home.join(if kind == "pii" { ".pi/pii" } else { ".pi/agent" }));
-                    look.newest(&dir.join("sessions").join(pi_slug(f.cwd)))
-                })?;
+            let dir = f
+                .agent_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(if kind == "pii" { ".pi/pii" } else { ".pi/agent" }))
+                .join("sessions")
+                .join(pi_slug(f.cwd));
+            let named = flag(&opts, &["--session-id", "--session"])
+                .or_else(|| f.labels.get("harbor.harness-session-id").cloned());
+            // The newest session in the cwd, never when another agent works there too.
+            let newest = (!f.shared_cwd).then(|| look.newest(&dir)).flatten();
+            let sid = match (named, newest) {
+                (Some(named), Some(newest)) => {
+                    // The named session, unless the agent has since written another one (/new, /resume).
+                    let file = if named.contains('/') {
+                        Some(named.clone())
+                    } else {
+                        look.glob(&format!("{}/*{named}.jsonl", dir.display())).pop()
+                    };
+                    let when = |p: &str| look.modified(Path::new(p));
+                    let moved = file.is_some_and(|f| f != newest && when(&newest) > when(&f));
+                    if moved { newest } else { named }
+                }
+                (named, newest) => named.or(newest)?,
+            };
             Some([kind.to_string(), "--session".into(), sid].into_iter().chain(kept(kind, &opts)).collect())
         }
         "claude" => {
@@ -367,6 +386,9 @@ impl Lookup for Disk {
             .max()
             .map(|(_, p)| p.display().to_string())
     }
+    fn modified(&self, path: &Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).ok()?.modified().ok()
+    }
     fn read(&self, path: &Path) -> Option<String> {
         std::fs::read(path).ok().map(|b| String::from_utf8_lossy(&b).into_owned())
     }
@@ -429,6 +451,15 @@ impl crate::runtime::Core {
         let due: Vec<_> = {
             let mut st = self.lock();
             let mut dropped = false;
+            // pi agents per cwd: they share one sessions folder there.
+            let mut cwds = BTreeMap::<String, usize>::new();
+            for t in
+                st.reg.terminals.values().filter(|t| t.is_live() && t.status.as_ref().is_some_and(|s| s.app == "pi"))
+            {
+                if let Some(f) = &t.foreground {
+                    *cwds.entry(f.cwd.clone()).or_default() += 1;
+                }
+            }
             let due = st
                 .reg
                 .terminals
@@ -440,17 +471,17 @@ impl crate::runtime::Core {
                     }
                     let fg = t.foreground.as_ref().filter(|f| !SHELLS.contains(&base(&f.name)))?;
                     let app = t.status.as_ref().map(|s| s.app.clone()).filter(|a| !a.is_empty())?;
-                    let fresh = t.resume.as_ref().is_some_and(|r| r.turn == t.turn && r.pid == fg.pid);
-                    // A failed read is retried every 5 s while the same process holds the turn
-                    // (its session file may not exist yet).
-                    let tried = t.resume_tried.is_some_and(|(turn, pid, at)| {
-                        turn == t.turn && pid == fg.pid && now.saturating_sub(at) < 5_000
+                    // Read again on a new turn or process, and every 15 s (an agent can switch
+                    // sessions in place, or not have written its session file yet).
+                    let recent = t.resume_tried.is_some_and(|(turn, pid, at)| {
+                        turn == t.turn && pid == fg.pid && now.saturating_sub(at) < 15_000
                     });
-                    if fresh || tried {
+                    if recent {
                         return None;
                     }
                     t.resume_tried = Some((t.turn, fg.pid, now));
-                    Some((t.id(), t.turn, app, t.argv.clone(), fg.clone(), t.labels.clone()))
+                    let shared = cwds.get(&fg.cwd).is_some_and(|n| *n > 1);
+                    Some((t.id(), t.turn, app, t.argv.clone(), fg.clone(), t.labels.clone(), shared))
                 })
                 .collect::<Vec<_>>();
             if dropped {
@@ -461,7 +492,7 @@ impl crate::runtime::Core {
         if due.is_empty() || !crate::config::load(&self.paths.config).is_ok_and(|c| c.resume_agents == Some(true)) {
             return;
         }
-        for (id, turn, app, argv, fg, labels) in due {
+        for (id, turn, app, argv, fg, labels, shared_cwd) in due {
             let read = tokio::task::spawn_blocking(move || {
                 let facts = Facts {
                     app: &app,
@@ -471,6 +502,7 @@ impl crate::runtime::Core {
                     pid: fg.pid,
                     labels: &labels,
                     agent_dir: crate::platform::env_var(fg.pid, "PI_CODING_AGENT_DIR"),
+                    shared_cwd,
                 };
                 (plan(&facts, &Disk), fg)
             });
@@ -481,10 +513,12 @@ impl crate::runtime::Core {
                 t.is_live() && t.turn == turn && t.foreground.as_ref().is_some_and(|f| f.pid == fg.pid)
             };
             let Some(t) = st.reg.terminals.get_mut(&id).filter(same) else { continue };
-            t.resume = Some(Resume { argv, cwd: fg.cwd, pid: fg.pid, name: fg.name, turn });
+            let next = Some(Resume { argv, cwd: fg.cwd, pid: fg.pid, name: fg.name, turn });
             t.resume_lost_ms = None;
-            t.resume_tried = None;
-            self.save_soon();
+            if t.resume != next {
+                t.resume = next;
+                self.save_soon();
+            }
         }
     }
 }
