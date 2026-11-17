@@ -92,6 +92,42 @@ fn kept_terminal_survives_core_crash_and_recovers_if_its_holder_is_also_lost() {
 }
 
 #[test]
+fn a_kept_agent_reopens_its_session_after_a_reboot() {
+    let mut s = Session::new();
+    s.env.push(("HC_FOREGROUND_MS".into(), "30".into()));
+    let bin = s.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // A fake pi: reports itself over OSC 7501, prints its arguments, then waits.
+    let pi = bin.join("pi");
+    std::fs::write(&pi, "#!/bin/sh\nprintf '\\033]7501;state=idle:app=pi\\033\\\\'\necho \"pi-args: $*\"\nexec sleep 100\n")
+        .unwrap();
+    std::fs::set_permissions(&pi, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())));
+    let config = s.root.join("config/herdr-core/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "resume_agents = true\nshell = [\"/bin/sh\"]\n").unwrap();
+    let sid = "0c4b7afc-1111-4222-8333-444455556666";
+    let t = run(&s, &["--keep", "pi", "--session-id", sid, "--model", "m1"]);
+    let state = s.root.join("state/herdr-core/test/terminals.json");
+    wait_until("its session recorded", || {
+        std::fs::read_to_string(&state).is_ok_and(|j| {
+            let j: serde_json::Value = serde_json::from_str(&j).unwrap_or_default();
+            j["terminals"]["1"]["resume"]["argv"] == serde_json::json!(["pi", "--session", sid, "--model", "m1"])
+        })
+    });
+    // A reboot: the core and the holder both go.
+    let old = get(&s, &t)["pid"].as_i64().unwrap();
+    let status = s.json(&["server", "status"]);
+    unsafe {
+        libc::kill(status["pid"].as_i64().unwrap() as i32, libc::SIGKILL);
+        libc::kill(status["holder"]["pid"].as_i64().unwrap() as i32, libc::SIGKILL);
+    }
+    wait_until("core gone", || !s.connect_ok());
+    wait_until("replacement on start", || get(&s, &t)["pid"].as_i64().is_some_and(|p| p != old));
+    wait_until("pi back on the same session", || text(&s, &t).contains(&format!("pi-args: --session {sid} --model m1")));
+}
+
+#[test]
 fn failed_shell_restart_stays_live_and_retries() {
     use std::os::unix::fs::PermissionsExt;
     let mut s = Session::new();
