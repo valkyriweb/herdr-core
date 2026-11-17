@@ -61,6 +61,7 @@ on its own (no notes to parent agents, no <hc> tags on messages).
 shell = ["nu"] overrides the shell for new terminals and keep recovery.
 draft_wait = 60: seconds a draft holds sends and notes after your last key;
 0 keeps only the quiet pause. Changes apply to the next delivery.
+resume_agents = true: keep recovery reopens pi, pii, Claude Code and Codex sessions.
 
 Examples
   hc run --on vps "cd app && npm test"     like ssh, in a terminal that stays

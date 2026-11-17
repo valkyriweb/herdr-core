@@ -179,6 +179,7 @@ impl Core {
                 if let Some(f) = &now {
                     t.last_cwd = Some(f.cwd.clone());
                 }
+                crate::resume::foreground_changed(t, now.as_ref(), crate::runtime::now_ms());
                 t.foreground = now.clone();
                 if change.is_some() || foreground_changed {
                     self.save_soon();
@@ -190,6 +191,7 @@ impl Core {
                     self.emit(&mut st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
                 }
             }
+            self.clone().capture_resumes().await;
         }
     }
 }

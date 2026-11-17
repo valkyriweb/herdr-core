@@ -1203,3 +1203,12 @@ pub mod console {
         }
     }
 }
+
+/// Not read on Windows: agent resume finds sessions another way or not at all.
+pub fn open_files(_pid: i32) -> Vec<String> {
+    vec![]
+}
+
+pub fn env_var(_pid: i32, _name: &str) -> Option<String> {
+    None
+}
