@@ -58,8 +58,8 @@ impl Core {
         }
         let config = crate::config::load(&self.paths.config);
         let resume_agents = config.as_ref().is_ok_and(|c| c.resume_agents == Some(true));
-        let (shell, restore_screen) =
-            match config.and_then(|settings| settings.shell().map(|shell| (shell, settings.restore_screen.unwrap_or(false))))
+        let (shell, restore_screen) = match config
+            .and_then(|settings| settings.shell().map(|shell| (shell, settings.restore_screen.unwrap_or(false))))
         {
             Ok(settings) => settings,
             Err(e) => {
