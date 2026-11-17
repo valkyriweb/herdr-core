@@ -99,8 +99,11 @@ fn a_kept_agent_reopens_its_session_after_a_reboot() {
     std::fs::create_dir(&bin).unwrap();
     // A fake pi: reports itself over OSC 7501, prints its arguments, then waits.
     let pi = bin.join("pi");
-    std::fs::write(&pi, "#!/bin/sh\nprintf '\\033]7501;state=idle:app=pi\\033\\\\'\necho \"pi-args: $*\"\nexec sleep 100\n")
-        .unwrap();
+    std::fs::write(
+        &pi,
+        "#!/bin/sh\nprintf '\\033]7501;state=idle:app=pi\\033\\\\'\necho \"pi-args: $*\"\nexec sleep 100\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&pi, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default())));
     let config = s.root.join("config/herdr-core/config.toml");
@@ -124,7 +127,9 @@ fn a_kept_agent_reopens_its_session_after_a_reboot() {
     }
     wait_until("core gone", || !s.connect_ok());
     wait_until("replacement on start", || get(&s, &t)["pid"].as_i64().is_some_and(|p| p != old));
-    wait_until("pi back on the same session", || text(&s, &t).contains(&format!("pi-args: --session {sid} --model m1")));
+    wait_until("pi back on the same session", || {
+        text(&s, &t).contains(&format!("pi-args: --session {sid} --model m1"))
+    });
 }
 
 #[test]
