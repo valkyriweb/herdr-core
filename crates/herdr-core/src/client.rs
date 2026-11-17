@@ -19,11 +19,19 @@ pub fn remember_exe() {
     build_id();
 }
 
+/// What a build names as its owner with `HC_INSTALLED_BY` at build time: a build
+/// from source is updated from there, so releases and apps leave it alone.
+pub const BUILT_BY: Option<&str> = option_env!("HC_INSTALLED_BY");
+
 /// The package manager this hc came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {
     let exe = EXE.get().cloned().or_else(|| std::env::current_exe().ok())?;
-    installed_by_path(&exe)
+    owner(BUILT_BY, &exe)
+}
+
+fn owner(built_by: Option<&'static str>, exe: &std::path::Path) -> Option<&'static str> {
+    built_by.filter(|b| !b.is_empty()).or_else(|| installed_by_path(exe))
 }
 
 pub(crate) fn installed_by_path(exe: &std::path::Path) -> Option<&'static str> {
@@ -45,6 +53,9 @@ fn the_package_manager_is_read_from_the_path() {
     assert_eq!(manager_of("/nix/store/abc-herdr-core/bin/herdr-core"), Some("nix"));
     assert_eq!(manager_of("/home/me/.local/share/mise/installs/herdr-core/0.2.0/herdr-core"), Some("mise"));
     assert_eq!(manager_of("/home/me/.local/bin/herdr-core"), None);
+    let exe = std::env::current_exe().unwrap();
+    assert_eq!(owner(Some("a source build"), &exe), Some("a source build"));
+    assert_eq!(owner(Some(""), &exe), installed_by_path(&exe));
 }
 
 /// Which build this process runs: the linker's build id, so a copy of the same

@@ -2,9 +2,11 @@
 # Builds a release binary into ~/.local/bin (replacing any older one), then
 # restarts the core the planned way so running terminals pick up the new build
 # (never handing this shell's environment to a core it has to start).
+# The build names itself a source build (HC_INSTALLED_BY), so hc update and the
+# Herdr app's core updates leave it alone; HC_INSTALLED_BY= builds a replaceable one.
 set -eu
 cd "$(dirname "$0")/.."
-nice -n 10 cargo build --release
+HC_INSTALLED_BY="${HC_INSTALLED_BY-a source build}" nice -n 10 cargo build --release
 bin="${HC_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$bin"
 if [ "$(uname -s)" = Darwin ]; then

@@ -61,6 +61,7 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
             "homebrew" => "brew upgrade herdr-core",
             "nix" => "update it in your Nix configuration",
             "mise" => "mise upgrade herdr-core",
+            m if Some(m) == client::BUILT_BY => "rebuild it from its source (just install)",
             _ => {
                 return Err(refused(
                     format!("{} isn't writable by you", dest.parent().unwrap().display()),
