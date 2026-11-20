@@ -284,8 +284,16 @@ fn messages_between_agents_say_who_sent_them() {
 
     hc_in(&s, &sender, &["send", &agent, "review it"]);
     wait_until("tagged", || text(&s, &agent).contains(&format!("got:<hc from=\"{sender} boss\">review it</hc>")));
-    s.json(&["send", &agent, "from a person"]);
     let line = |t: &str, want: &str| text(&s, t).lines().any(|l| l.trim_end() == want);
+    hc_in(&s, &sender, &["send", &agent, "/model clawrouter/gpt-6.2-astra-200k"]);
+    wait_until("a slash command arrives unwrapped", || line(&agent, "got:/model clawrouter/gpt-6.2-astra-200k"));
+    hc_in(&s, &sender, &["send", &agent, "  /thinking high"]);
+    wait_until("leading spaces survive", || line(&agent, "got:  /thinking high"));
+    hc_in(&s, &sender, &["send", &agent, "run this later:\n/model x"]);
+    wait_until("a slash on a later line stays tagged", || {
+        line(&agent, &format!("got:<hc from=\"{sender} boss\">run this later:")) && line(&agent, "got:/model x</hc>")
+    });
+    s.json(&["send", &agent, "from a person"]);
     wait_until("a person's send is untouched", || line(&agent, "got:from a person"));
     hc_in(&s, &sender, &["send", &shell, "ls"]);
     wait_until("a shell gets the command as is", || line(&shell, "got:ls"));
