@@ -531,8 +531,9 @@ Arguments:
   <TEXT>      Pasted, then submitted with Enter
 
 Options:
-      --force              Type even if the program is blocked (it may answer its dialog)
+      --command            Send a single-line slash command without the sender tag
       --json               JSON output even in a terminal
+      --force              Type even if the program is blocked (it may answer its dialog)
       --if <STATUS>        Only type if the status is exactly this [possible values: idle, working]
       --wait               Then wait for the turn this send started
       --timeout <TIMEOUT>  With wait: seconds before it checks in (default: config, else 180)

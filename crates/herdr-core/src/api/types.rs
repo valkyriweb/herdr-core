@@ -487,6 +487,10 @@ pub struct SendParams {
     pub terminal: String,
     /// Pasted, then submitted with Enter.
     pub text: String,
+    /// Send a single-line slash command without the sender tag.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub command: bool,
     /// Type even if the program is blocked (it may answer its dialog).
     #[arg(long)]
     #[serde(default)]

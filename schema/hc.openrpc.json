@@ -2571,7 +2571,7 @@
       }
     },
     {
-      "description": "Paste text and press Enter after a person sends or clears their draft (at most 60 s since their last key), otherwise after ~3 s of quiet. Keys pressed during delivery are held, then delivered. Refuses a blocked program unless `force`.",
+      "description": "Paste text and press Enter after a person sends or clears their draft (at most 60 s since their last key), otherwise after ~3 s of quiet. Keys pressed during delivery are held, then delivered. Refuses a blocked program unless `force`. Set `command` to omit the sender tag for one slash command.",
       "errors": [
         {
           "code": -32000,
@@ -2650,6 +2650,15 @@
               "string",
               "null"
             ]
+          }
+        },
+        {
+          "description": "Send a single-line slash command without the sender tag.",
+          "name": "command",
+          "required": false,
+          "schema": {
+            "description": "Send a single-line slash command without the sender tag.",
+            "type": "boolean"
           }
         },
         {

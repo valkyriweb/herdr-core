@@ -109,7 +109,7 @@ methods! { Ctx<'_>;
         "Open a raw stream to a live terminal on this framed connection (see `hello` with `framed`). Loss ends the stream even when kept; reattach after the restarted event.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "needs_framed"];
     "terminal.send" => terminal_send, SendParams => SendResult,
-        "Paste text and press Enter after a person sends or clears their draft (at most 60 s since their last key), otherwise after ~3 s of quiet. Keys pressed during delivery are held, then delivered. Refuses a blocked program unless `force`.",
+        "Paste text and press Enter after a person sends or clears their draft (at most 60 s since their last key), otherwise after ~3 s of quiet. Keys pressed during delivery are held, then delivered. Refuses a blocked program unless `force`. Set `command` to omit the sender tag for one slash command.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "invalid_params", "config", "cancelled"];
     "terminal.wait" => terminal_wait, WaitParams => crate::wait::WaitResult,
         "Wait until the program is not working (any word but working, or it exited/was lost); already not working returns at once. A program that never reported status is working until it exits. After a send from the same caller, waits for the turn that send started. A message to the caller also ends it: ended false, reason message, from = sender. A timeout is a check-in: ended false, current status.",
@@ -483,10 +483,25 @@ async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<AttachResult,
 }
 
 async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
+    if p.command
+        && (!p.text.starts_with('/')
+            || p.text.contains(|c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')))
+    {
+        return Err(RpcError::invalid_params(
+            "--command needs a single line starting with '/' and no control characters",
+        ));
+    }
     let timeout = wait_timeout(core, p.timeout)?; // checked before anything is typed
     let id = resolve(core, &p.terminal)?;
-    let text = core.tagged(p.caller.as_deref(), id, &p.text, false);
+    let text = if p.command { p.text } else { core.tagged(p.caller.as_deref(), id, &p.text, false) };
     let sent = core.send(id, &text, p.force, p.only_if.map(|w| word(&w)).as_deref()).await?;
+    if p.command {
+        // Command arguments can contain secrets.
+        let from = p.caller.as_deref().unwrap_or("unknown");
+        let to = crate::terminals::address(id);
+        let command = text.split_whitespace().next().unwrap_or_default();
+        let _ = writeln!(io::stderr(), "core: command send from={from:?} to={to} command={command:?}");
+    }
     if let Some(child) = p.caller.as_deref().and_then(crate::terminals::parse_id) {
         let mut st = core.lock();
         if let Some(c) = st
