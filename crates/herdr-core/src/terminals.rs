@@ -110,7 +110,7 @@ pub struct Terminal {
     /// viewer must hear it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub win32_input: bool,
-    /// The `HC_SCOPE` token everything it started carries, to end them all.
+    /// Crash-only cleanup token: used if its holder is lost, never on a normal end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     #[serde(default)]
@@ -222,6 +222,11 @@ pub struct Registry {
     /// The holder these terminals run under.
     pub holder: Option<String>,
     pub terminals: BTreeMap<u32, Terminal>,
+    /// Viewer drafts saved only for planned handover; older cores ignore this field.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drafts: BTreeMap<u32, crate::input::SavedGate>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replies: BTreeMap<u32, Vec<u8>>,
 }
 
 #[derive(Default)]

@@ -19,11 +19,19 @@ pub fn remember_exe() {
     build_id();
 }
 
+/// What a build names as its owner with `HC_INSTALLED_BY` at build time: a build
+/// from source is updated from there, so releases and apps leave it alone.
+pub const BUILT_BY: Option<&str> = option_env!("HC_INSTALLED_BY");
+
 /// The package manager this hc came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {
     let exe = EXE.get().cloned().or_else(|| std::env::current_exe().ok())?;
-    installed_by_path(&exe)
+    owner(BUILT_BY, &exe)
+}
+
+fn owner(built_by: Option<&'static str>, exe: &std::path::Path) -> Option<&'static str> {
+    built_by.filter(|b| !b.is_empty()).or_else(|| installed_by_path(exe))
 }
 
 pub(crate) fn installed_by_path(exe: &std::path::Path) -> Option<&'static str> {
@@ -45,6 +53,9 @@ fn the_package_manager_is_read_from_the_path() {
     assert_eq!(manager_of("/nix/store/abc-herdr-core/bin/herdr-core"), Some("nix"));
     assert_eq!(manager_of("/home/me/.local/share/mise/installs/herdr-core/0.2.0/herdr-core"), Some("mise"));
     assert_eq!(manager_of("/home/me/.local/bin/herdr-core"), None);
+    let exe = std::env::current_exe().unwrap();
+    assert_eq!(owner(Some("a source build"), &exe), Some("a source build"));
+    assert_eq!(owner(Some(""), &exe), installed_by_path(&exe));
 }
 
 /// Which build this process runs: the linker's build id, so a copy of the same
@@ -95,6 +106,29 @@ fn connect_starting(paths: &Paths, explicit: bool) -> Result<Stream, RpcError> {
         return Err(err);
     }
     platform::may_autostart(explicit)?;
+    paths.create_dirs().map_err(|e| unavailable(format!("cannot start core: {e}")))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.state.join("core.lock"))
+        .map_err(|e| unavailable(format!("cannot open core lock: {e}")))?;
+    let start = Instant::now();
+    loop {
+        if let Ok(stream) = platform::connect(&paths.socket) {
+            return Ok(stream);
+        }
+        // A closing connection does not mean serve has released its lock yet.
+        // Starting its replacement early would make that process exit immediately.
+        if platform::try_lock(&lock) {
+            break;
+        }
+        if start.elapsed() > START_WAIT {
+            return Err(unavailable(format!("core did not stop or start within {} s", START_WAIT.as_secs())));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(lock);
     spawn_core(paths)?;
     wait_for_socket(&paths.socket, "core").map_err(unavailable)
 }
@@ -180,6 +214,9 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     let exe = EXE.get().cloned().map_or_else(std::env::current_exe, Ok)?;
     let exe = if args.first() == Some(&"serve") { platform::core_executable(&exe) } else { exe };
     let mut cmd = Command::new(exe);
+    if args.first() == Some(&"serve") {
+        platform::core_environment(&mut cmd, &paths.state);
+    }
     // A core or holder started from inside a terminal is not that terminal's:
     // ending the terminal must not end them.
     cmd.args(args).env_remove(crate::sweep::VAR).env(crate::sweep::RUNTIME, "1");
@@ -194,14 +231,19 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     platform::spawn_detached(cmd, log)
 }
 
+/// How long a starting core or holder may take to answer. A busy machine (or
+/// one right after an update) can need well over 5 s; giving up early reports
+/// a failure while the program is still coming up.
+const START_WAIT: Duration = Duration::from_secs(15);
+
 pub fn wait_for_socket(path: &std::path::Path, what: &str) -> Result<Stream, String> {
     let start = Instant::now();
     loop {
         if let Ok(stream) = platform::connect(path) {
             return Ok(stream);
         }
-        if start.elapsed() > Duration::from_secs(5) {
-            return Err(format!("{what} did not start within 5 s"));
+        if start.elapsed() > START_WAIT {
+            return Err(format!("{what} did not start within {} s", START_WAIT.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
