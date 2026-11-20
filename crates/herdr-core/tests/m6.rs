@@ -357,21 +357,33 @@ fn messages_between_agents_say_who_sent_them() {
     hc_in(&s, &sender, &["send", &agent, "review it"]);
     wait_until("tagged", || text(&s, &agent).contains(&format!("got:<hc from=\"{sender} boss\">review it</hc>")));
     let line = |t: &str, want: &str| text(&s, t).lines().any(|l| l.trim_end() == want);
-    hc_in(&s, &sender, &["send", &agent, "/model clawrouter/gpt-6.2-astra-200k"]);
-    wait_until("a slash command arrives unwrapped", || line(&agent, "got:/model clawrouter/gpt-6.2-astra-200k"));
-    hc_in(&s, &sender, &["send", &agent, "  /thinking high"]);
-    wait_until("leading spaces survive", || line(&agent, "got:  /thinking high"));
-    for (first, last) in [("run this later:", "/model x"), ("/model x", "run this later")] {
-        hc_in(&s, &sender, &["send", &agent, &format!("{first}\n{last}")]);
-        wait_until("a multiline message stays tagged", || {
-            line(&agent, &format!("got:<hc from=\"{sender} boss\">{first}"))
-                && line(&agent, &format!("got:{last}</hc>"))
-        });
-    }
-    hc_in(&s, &sender, &["send", &agent, "/tmp/result.md"]);
-    wait_until("an absolute path stays tagged", || {
-        line(&agent, &format!("got:<hc from=\"{sender} boss\">/tmp/result.md</hc>"))
+    hc_in(&s, &sender, &["send", &agent, "/model x"]);
+    wait_until("a command without the flag stays tagged", || {
+        line(&agent, &format!("got:<hc from=\"{sender} boss\">/model x</hc>"))
     });
+    hc_in(&s, &sender, &["send", &agent, "/model later\nnot yet"]);
+    wait_until("multiline text starting with a slash stays tagged", || {
+        line(&agent, &format!("got:<hc from=\"{sender} boss\">/model later")) && line(&agent, "got:not yet</hc>")
+    });
+    hc_in(&s, &sender, &["send", "--command", &agent, "/model raw-command-argument"]);
+    wait_until("an explicit command arrives unwrapped", || line(&agent, "got:/model raw-command-argument"));
+    let log = std::fs::read_to_string(s.root.join("state/herdr-core/test/core.log")).unwrap();
+    assert!(
+        log.lines().any(|line| line == format!("core: command send from={sender:?} to={agent} command=\"/model\"")),
+        "{log}"
+    );
+    assert!(!log.contains("raw-command-argument"));
+    for invalid in ["/model x\nsecond line", "/model x\rsecond line", "/model x\x1b", "not a slash command"] {
+        let out = s
+            .cmd()
+            .env("HC_TERMINAL_ID", &sender)
+            .args(["--json", "send", "--command", &agent, invalid])
+            .output()
+            .unwrap();
+        let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+        assert!(!out.status.success());
+        assert_eq!(err["error"]["kind"], "invalid_params", "{err}");
+    }
     s.json(&["send", &agent, "from a person"]);
     wait_until("a person's send is untouched", || line(&agent, "got:from a person"));
     hc_in(&s, &sender, &["send", &shell, "ls"]);
