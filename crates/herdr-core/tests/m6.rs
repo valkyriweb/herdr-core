@@ -361,10 +361,13 @@ fn messages_between_agents_say_who_sent_them() {
     wait_until("a slash command arrives unwrapped", || line(&agent, "got:/model clawrouter/gpt-6.2-astra-200k"));
     hc_in(&s, &sender, &["send", &agent, "  /thinking high"]);
     wait_until("leading spaces survive", || line(&agent, "got:  /thinking high"));
-    hc_in(&s, &sender, &["send", &agent, "run this later:\n/model x"]);
-    wait_until("a slash on a later line stays tagged", || {
-        line(&agent, &format!("got:<hc from=\"{sender} boss\">run this later:")) && line(&agent, "got:/model x</hc>")
-    });
+    for (first, last) in [("run this later:", "/model x"), ("/model x", "run this later")] {
+        hc_in(&s, &sender, &["send", &agent, &format!("{first}\n{last}")]);
+        wait_until("a multiline message stays tagged", || {
+            line(&agent, &format!("got:<hc from=\"{sender} boss\">{first}"))
+                && line(&agent, &format!("got:{last}</hc>"))
+        });
+    }
     hc_in(&s, &sender, &["send", &agent, "/tmp/result.md"]);
     wait_until("an absolute path stays tagged", || {
         line(&agent, &format!("got:<hc from=\"{sender} boss\">/tmp/result.md</hc>"))

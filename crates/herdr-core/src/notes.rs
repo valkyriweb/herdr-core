@@ -139,17 +139,10 @@ impl Core {
 
     /// Text from the agent `from` (a caller address) to the agent `to`, wrapped in
     /// a tag that says who sent it. As is when either isn't an agent: a person,
-    /// a shell, a dialog. Slash commands also pass through as is. `reach`: also
-    /// say how to answer (a worker's first message).
+    /// a shell, a dialog. `reach`: also say how to answer (a worker's first message).
     pub fn tagged(&self, from: Option<&str>, to: u32, text: &str, reach: bool) -> String {
-        // A path such as /tmp/result.md is a report, not a command.
-        let command = text
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().next())
-            .and_then(|word| word.strip_prefix('/'))
-            .is_some_and(|name| !name.is_empty() && !name.contains('/'));
-        if command || !self.notes_on() {
+        // `notes = false`: nothing hc adds on its own, tags included.
+        if !self.notes_on() {
             return text.to_string();
         }
         let st = self.lock();
