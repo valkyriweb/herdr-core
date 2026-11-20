@@ -11,23 +11,28 @@ impl Lookup for Fake {
         "/h".into()
     }
     fn newest(&self, dir: &Path) -> Option<String> {
-        let dir = format!("{}/", dir.display());
+        let dir = format!("{}/", key(dir));
         self.files.keys().filter(|k| k.starts_with(&dir)).max().cloned()
     }
     /// Files sort by name in write order.
     fn modified(&self, path: &Path) -> Option<std::time::SystemTime> {
-        let rank = self.files.keys().position(|k| *k == path.display().to_string())?;
+        let rank = self.files.keys().position(|k| *k == key(path))?;
         Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(rank as u64))
     }
     fn read(&self, path: &Path) -> Option<String> {
-        self.files.get(&path.display().to_string()).cloned()
+        self.files.get(&key(path)).cloned()
     }
     fn open_files(&self, _pid: i32) -> Vec<String> {
         self.open.clone()
     }
     fn glob(&self, pattern: &str) -> Vec<String> {
-        self.files.keys().filter(|k| wild_path(pattern, k)).cloned().collect()
+        self.files.keys().filter(|k| wild_path(&pattern.replace('\\', "/"), k)).cloned().collect()
     }
+}
+
+/// Fake files are keyed with `/`; Windows joins paths with `\`.
+fn key(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn wild_path(pattern: &str, path: &str) -> bool {

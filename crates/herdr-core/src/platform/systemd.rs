@@ -6,14 +6,16 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
+use std::iter::Peekable;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::Bytes;
 
 /// What the login session decides. Programs get it from the user manager as
 /// it is now; a service takes the caller's only when the caller isn't an ssh
 /// login (desktops that don't share theirs with systemd: i3, startx).
-const SESSION: &[&str] = &[
+pub(super) const SESSION: &[&str] = &[
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "XAUTHORITY",
@@ -46,11 +48,15 @@ pub const SERVICE: &[&str] = &[
     "LISTEN_FDNAMES",
 ];
 
+pub(super) fn runtime_dir() -> PathBuf {
+    PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+}
+
 /// The user's runtime dir when this process uses it and a user manager runs
 /// there. Err(true): the default runtime dir but no manager (warn); Err(false):
 /// a custom runtime dir (isolated sessions, tests), which stays on its own.
 fn manager() -> Result<PathBuf, bool> {
-    let run = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+    let run = runtime_dir();
     let ours = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()).map_or_else(|| run.clone(), PathBuf::from);
     match (ours == run, run.join("systemd/private").exists()) {
         (true, true) => Ok(run),
@@ -109,13 +115,13 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
         Ok(dir) => dir,
         Err(e) => return Some(Err(e)),
     };
+    let command_arguments = service_command_args(cmd, log, version);
     let out = Command::new("systemd-run")
         .env_clear()
         .envs(&env)
         .args(unit_args(&name, &dir.join("environment"), &unset, log, &here, version))
         .args(guarded.then(|| shutdown_order(cmd, log)).into_iter().flat_map(|order| [OsString::from("-p"), order]))
-        .arg(literal(cmd.get_program()))
-        .args(cmd.get_args().map(literal))
+        .args(command_arguments.iter().map(|argument| literal(argument)))
         .stdin(Stdio::null())
         .output();
     let started = match out {
@@ -214,7 +220,7 @@ fn write_environment(run: &Path, name: &str, env: &BTreeMap<String, String>) -> 
 
 /// The caller's environment as a service gets it: no ssh login's session, no
 /// service's, and only names systemd accepts (a bash function's isn't one).
-fn service_env(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
+pub(super) fn service_env(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
     let ssh = super::SSH_LOGIN.iter().any(|k| env.contains_key(*k));
     let valid = |k: &str| {
         k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -236,7 +242,17 @@ fn service_env(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
 /// flooding the user manager until it starts nothing. KillMode: when the core
 /// or holder exits, nothing else goes with it.
 fn unit_args(name: &str, environment: &Path, unset: &[&str], log: &Path, here: &Path, version: u32) -> Vec<OsString> {
-    let mut out: Vec<OsString> = ["--user", "--quiet", "--collect", "--service-type=exec"].map(OsString::from).into();
+    let mut unset_environment_names = unset.to_vec();
+    unset_environment_names.sort_unstable();
+    unset_environment_names.dedup();
+    let service_type = if version >= 240 { "--service-type=exec" } else { "--service-type=simple" };
+    let supports_native_append_logging = version >= 240;
+    let stderr_destination = if supports_native_append_logging {
+        format!("StandardError=append:{}", log.display())
+    } else {
+        "StandardError=journal".into()
+    };
+    let mut out: Vec<OsString> = ["--user", "--quiet", "--collect", service_type].map(OsString::from).into();
     if version >= 243 {
         out.extend([OsString::from("-p"), OsString::from("OOMPolicy=continue")]);
     }
@@ -249,8 +265,8 @@ fn unit_args(name: &str, environment: &Path, unset: &[&str], log: &Path, here: &
         format!("WorkingDirectory={}", here.display()),
         "KillMode=process".into(),
         "StandardOutput=null".into(),
-        format!("StandardError=append:{}", log.display()),
-        format!("UnsetEnvironment={}", unset.join(" ")),
+        stderr_destination,
+        format!("UnsetEnvironment={}", unset_environment_names.join(" ")),
     ] {
         if !p.starts_with("--") {
             out.push("-p".into());
@@ -258,6 +274,24 @@ fn unit_args(name: &str, environment: &Path, unset: &[&str], log: &Path, here: &
         out.push(p.into());
     }
     out
+}
+
+fn service_command_args(command: &Command, log_path: &Path, systemd_version: u32) -> Vec<OsString> {
+    let mut command_arguments = Vec::new();
+    let supports_native_append_logging = systemd_version >= 240;
+    if !supports_native_append_logging {
+        // exec preserves systemd's main PID; positional parameters prevent shell evaluation of paths.
+        let append_stderr_and_exec_script = "exec \"$@\" 2>>\"$0\"";
+        command_arguments.extend([
+            OsString::from("/bin/sh"),
+            "-c".into(),
+            append_stderr_and_exec_script.into(),
+            log_path.as_os_str().to_owned(),
+        ]);
+    }
+    command_arguments.push(command.get_program().to_owned());
+    command_arguments.extend(command.get_args().map(OsStr::to_owned));
+    command_arguments
 }
 
 fn shutdown_order(cmd: &Command, log: &Path) -> OsString {
@@ -270,17 +304,128 @@ fn literal(arg: &OsStr) -> OsString {
     arg.to_string_lossy().replace('$', "$$").into()
 }
 
-/// Without linger the user manager, and every hc service with it, stops when
-/// the user's last login ends.
-fn linger() {
-    let user = unsafe {
-        let pw = libc::getpwuid(libc::getuid());
-        if pw.is_null() {
-            return;
+static LOGOUT_LINGER: std::sync::Mutex<(Option<bool>, Option<String>)> = std::sync::Mutex::new((None, None));
+static LINGER_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+pub fn logout_linger() -> (Option<bool>, Option<String>) {
+    LOGOUT_LINGER.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+pub fn start_logout_linger() {
+    tokio::spawn(async {
+        loop {
+            let observed = observe_logout_linger().await;
+            *LOGOUT_LINGER.lock().unwrap_or_else(|p| p.into_inner()) = observed;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
+                _ = LINGER_CHANGED.notified() => {},
+            }
         }
-        std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().into_owned()
+    });
+    if manager().is_ok() {
+        linger();
+    }
+}
+
+async fn observe_logout_linger() -> (Option<bool>, Option<String>) {
+    if manager().is_err() {
+        return (None, None);
+    }
+    let Some(user) = login_user() else { return (None, None) };
+    let linger = linger_enabled(Path::new("/var/lib/systemd/linger"), &user);
+    let survives = match linger {
+        Some(false) => logout_survival(linger, stop_delay().await.as_deref()),
+        other => other,
     };
-    if Path::new("/var/lib/systemd/linger").join(&user).exists() {
+    (survives, Some(user))
+}
+
+fn linger_enabled(directory: &Path, user: &str) -> Option<bool> {
+    let escaped: String = user
+        .bytes()
+        .map(|byte| match byte {
+            b'\x07' => "\\a".into(),
+            b'\x08' => "\\b".into(),
+            b'\x0c' => "\\f".into(),
+            b'\n' => "\\n".into(),
+            b'\r' => "\\r".into(),
+            b'\t' => "\\t".into(),
+            b'\x0b' => "\\v".into(),
+            b'\\' => "\\\\".into(),
+            b'\'' => "\\'".into(),
+            b'"' => "\\\"".into(),
+            b' '..=b'~' => char::from(byte).to_string(),
+            _ => format!("\\{:03o}", byte),
+        })
+        .collect();
+    directory.join(escaped).try_exists().ok()
+}
+
+async fn stop_delay() -> Option<String> {
+    let mut command = tokio::process::Command::new("busctl");
+    command.args([
+        "--timeout=1",
+        "get-property",
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        "UserStopDelayUSec",
+    ]);
+    stop_delay_command(command).await
+}
+
+async fn stop_delay_command(mut command: tokio::process::Command) -> Option<String> {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true).process_group(0);
+    let child = command.spawn().ok()?;
+    // Kill the private group too, including helpers inheriting the output pipe.
+    struct ProcessGroup(u32);
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            unsafe { libc::kill(-(self.0 as i32), libc::SIGKILL) };
+        }
+    }
+    let group = ProcessGroup(child.id()?);
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(1), &mut output).await {
+        Ok(out) => out.ok()?,
+        Err(_) => {
+            drop(group);
+            let _ = output.await;
+            return None;
+        }
+    };
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn logout_survival(linger: Option<bool>, stop_delay: Option<&str>) -> Option<bool> {
+    if linger != Some(false) {
+        return linger;
+    }
+    // Per-user finite delays override the global value; infinity means unset.
+    // Only a finite global delay proves that logind will stop this manager.
+    let delay = stop_delay?.strip_prefix("t ")?.trim().parse::<u64>().ok()?;
+    (delay != u64::MAX).then_some(false)
+}
+
+fn login_user() -> Option<String> {
+    // getpwuid_r keeps simultaneous status requests from sharing libc's buffer.
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = vec![0u8; 16384];
+    let mut result = std::ptr::null_mut();
+    let error = unsafe {
+        libc::getpwuid_r(libc::getuid(), entry.as_mut_ptr(), buffer.as_mut_ptr().cast(), buffer.len(), &mut result)
+    };
+    if error != 0 || result.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr((*result).pw_name) }.to_string_lossy().into_owned())
+}
+
+/// Linger keeps the user manager alive independently of logind's stop delay.
+fn linger() {
+    let Some(user) = login_user() else { return };
+    if linger_enabled(Path::new("/var/lib/systemd/linger"), &user) == Some(true) {
         return;
     }
     // Polkit can leave loginctl waiting for 25 seconds, longer than a
@@ -294,16 +439,19 @@ fn linger() {
 fn enable_linger(mut command: Command, user: String) -> io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("hc-linger".into()).spawn(move || {
         let enabled = command
-            .args(["--no-ask-password", "enable-linger", &user])
+            .args(["--no-ask-password", "enable-linger", "--", &user])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
+        LINGER_CHANGED.notify_one();
         if enabled {
             eprintln!("hc: turned on linger for {user}, so the core outlives your logins");
         } else {
-            eprintln!("hc: the core stops when your last login ends; `sudo loginctl enable-linger {user}` keeps it");
+            eprintln!(
+                "hc: the core may stop when your last login ends; `sudo loginctl enable-linger -- {user}` keeps it"
+            );
         }
     })
 }
@@ -314,16 +462,90 @@ pub fn manager_env() -> Option<BTreeMap<String, String>> {
     let run = manager().ok()?;
     let out = Command::new("busctl")
         .env("XDG_RUNTIME_DIR", run)
-        .args(["--user", "--json=short", "--timeout=1", "get-property", "org.freedesktop.systemd1"])
+        .args(["--user", "--timeout=1", "get-property", "org.freedesktop.systemd1"])
         .args(["/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "Environment"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let pairs = shown["data"].as_array()?.iter().filter_map(|v| v.as_str()?.split_once('='));
-    Some(pairs.map(|(k, v)| (k.into(), v.into())).collect())
+    parse_busctl_environment(&out.stdout)
+}
+
+fn parse_busctl_environment(reply_bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+    let reply_text = std::str::from_utf8(reply_bytes).ok()?;
+    let mut header_fields = reply_text.trim().splitn(3, ' ');
+    let signature = header_fields.next()?;
+    if signature != "as" {
+        return None;
+    }
+    let environment_entry_count = header_fields.next()?.parse::<usize>().ok()?;
+    let mut remaining_reply = header_fields.next().unwrap_or_default().bytes().peekable();
+    let mut environment = BTreeMap::new();
+    for _ in 0..environment_entry_count {
+        let environment_entry = parse_busctl_quoted_string(&mut remaining_reply)?;
+        if let Some((variable_name, variable_value)) = environment_entry.split_once('=') {
+            environment.insert(variable_name.into(), variable_value.into());
+        }
+    }
+    if remaining_reply.any(|byte| !byte.is_ascii_whitespace()) {
+        return None;
+    }
+    Some(environment)
+}
+
+fn parse_busctl_quoted_string(remaining_reply: &mut Peekable<Bytes<'_>>) -> Option<String> {
+    while remaining_reply.peek().is_some_and(u8::is_ascii_whitespace) {
+        remaining_reply.next();
+    }
+    if remaining_reply.next()? != b'"' {
+        return None;
+    }
+    let mut decoded_bytes = Vec::new();
+    loop {
+        match remaining_reply.next()? {
+            b'"' => break,
+            b'\\' => decoded_bytes.push(decode_busctl_escape(remaining_reply)?),
+            byte if byte.is_ascii_control() => return None,
+            byte => decoded_bytes.push(byte),
+        }
+    }
+    let has_invalid_delimiter = remaining_reply.peek().is_some_and(|byte| !byte.is_ascii_whitespace());
+    if has_invalid_delimiter {
+        return None;
+    }
+    // Octal escapes can encode individual bytes of a multibyte UTF-8 character.
+    String::from_utf8(decoded_bytes).ok()
+}
+
+fn decode_busctl_escape(remaining_reply: &mut Peekable<Bytes<'_>>) -> Option<u8> {
+    let escape_code = remaining_reply.next()?;
+    let decoded_byte = match escape_code {
+        b'a' => b'\x07',
+        b'b' => b'\x08',
+        b'f' => b'\x0c',
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'v' => b'\x0b',
+        b'\\' => b'\\',
+        b'\'' => b'\'',
+        b'"' => b'"',
+        b'0'..=b'3' => {
+            let first_octal_digit = escape_code - b'0';
+            let second_octal_digit = remaining_reply.next()?.checked_sub(b'0')?;
+            let third_octal_digit = remaining_reply.next()?.checked_sub(b'0')?;
+            if second_octal_digit > 7 || third_octal_digit > 7 {
+                return None;
+            }
+            first_octal_digit * 64 + second_octal_digit * 8 + third_octal_digit
+        }
+        _ => return None,
+    };
+    if decoded_byte == b'\0' {
+        return None;
+    }
+    Some(decoded_byte)
 }
 
 /// Puts the login session's variables the manager has into `env`.
@@ -344,6 +566,78 @@ mod tests {
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn linger_marker_is_rechecked_after_admin_changes() {
+        let root = std::env::temp_dir().join(format!("hc-linger-{}", super::super::random_hex()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(super::linger_enabled(&root, "test"), Some(false));
+        std::fs::write(root.join("test"), "").unwrap();
+        assert_eq!(super::linger_enabled(&root, "test"), Some(true));
+        std::fs::remove_file(root.join("test")).unwrap();
+        assert_eq!(super::linger_enabled(&root, "test"), Some(false));
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn escaped_account_marker_is_rechecked() {
+        let root = std::env::temp_dir().join(format!("hc-linger-{}", super::super::random_hex()));
+        std::fs::create_dir_all(&root).unwrap();
+        let user = "DOMAIN\\o'né";
+        let marker = root.join(r"DOMAIN\\o\'n\303\251");
+        assert_eq!(super::linger_enabled(&root, user), Some(false));
+        std::fs::write(&marker, "").unwrap();
+        assert_eq!(super::linger_enabled(&root, user), Some(true));
+        std::fs::remove_file(marker).unwrap();
+        assert_eq!(super::linger_enabled(&root, user), Some(false));
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_policy_query_does_not_block_and_is_reaped() {
+        let directory = Path::new("/var/tmp").join(format!("hc-policy-{}", super::super::random_hex()));
+        std::fs::create_dir(&directory).unwrap();
+        let pid_file = directory.join("pid");
+        use std::os::unix::fs::PermissionsExt;
+        let fake_busctl = directory.join("busctl");
+        std::fs::write(&fake_busctl, "#!/bin/sh\necho $$ > \"$1\"\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_busctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = tokio::process::Command::new("busctl");
+        command.env("PATH", &directory).arg(&pid_file);
+        let query = tokio::spawn(super::stop_delay_command(command));
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !pid_file.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("query blocked the executor");
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            super::logout_linger();
+            tokio::task::yield_now().await;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(250));
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert_eq!(query.await.unwrap(), None);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "policy child leaked");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_linger_warns_only_with_a_known_finite_stop_delay() {
+        for (delay, expected) in [
+            (Some("t 10000000\n"), Some(false)),
+            (Some("t 0\n"), Some(false)),
+            (Some("t 18446744073709551615\n"), None),
+            (Some("not a property"), None),
+            (None, None),
+        ] {
+            assert_eq!(super::logout_survival(Some(false), delay), expected);
+            assert_eq!(super::logout_survival(Some(true), delay), Some(true));
+            assert_eq!(super::logout_survival(None, delay), None);
+        }
     }
 
     #[test]
@@ -400,6 +694,8 @@ mod tests {
             "UnsetEnvironment=HC_SCOPE",
             "OOMPolicy=continue",
             "WorkingDirectory=/",
+            "--service-type=exec",
+            "StandardError=append:/s/x.log",
         ] {
             assert!(args.iter().any(|a| a == want), "{want} missing from {args:?}");
         }
@@ -420,6 +716,77 @@ mod tests {
         assert!(args.contains(&"WorkingDirectory=/home/user/my project/a%hb".into()));
         assert!(!args.iter().any(|a| a.to_string_lossy().contains("OOMPolicy")));
         assert!(!args.iter().any(|a| a == "--same-dir" || a.to_string_lossy().starts_with("--working-directory")));
+        assert!(args.contains(&"--service-type=simple".into()));
+        assert!(args.contains(&"StandardError=journal".into()));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--service-type=exec" || a.to_string_lossy().starts_with("StandardError=append:"))
+        );
+    }
+
+    #[test]
+    fn restart_unsets_each_environment_name_only_once() {
+        for systemd_version in [239, 252] {
+            let unit_arguments = super::unit_args(
+                "hc-serve-1",
+                Path::new("/run/user/1/hc-serve-1/environment"),
+                &["SSH_CONNECTION", "HC_SCOPE", "SSH_CONNECTION", "HC_SCOPE"],
+                Path::new("/s/x.log"),
+                Path::new("/"),
+                systemd_version,
+            );
+            assert!(unit_arguments.contains(&"UnsetEnvironment=HC_SCOPE SSH_CONNECTION".into()));
+        }
+    }
+
+    #[test]
+    fn newer_systemd_keeps_direct_exec_and_append_logging() {
+        let mut core_command = Command::new("/bin/hc");
+        core_command.args(["serve", "--socket", "/run/${USER}.sock"]);
+        for systemd_version in [240, 243, 259] {
+            let unit_arguments = super::unit_args(
+                "hc-serve-1",
+                Path::new("/run/user/1/hc-serve-1/environment"),
+                &[],
+                Path::new("/s/x.log"),
+                Path::new("/"),
+                systemd_version,
+            );
+            assert!(unit_arguments.contains(&"--service-type=exec".into()));
+            assert!(unit_arguments.contains(&"StandardError=append:/s/x.log".into()));
+            assert_eq!(unit_arguments.contains(&"OOMPolicy=continue".into()), systemd_version >= 243);
+            assert_eq!(
+                super::service_command_args(&core_command, Path::new("/s/x.log"), systemd_version),
+                ["/bin/hc", "serve", "--socket", "/run/${USER}.sock"].map(std::ffi::OsString::from),
+            );
+        }
+    }
+
+    #[test]
+    fn older_systemd_appends_logs_without_changing_the_main_pid() {
+        use std::os::unix::fs::DirBuilderExt;
+        let test_directory = crate::test_tmp().join(format!("hc-legacy-log-{}", super::super::random_hex()));
+        std::fs::DirBuilder::new().mode(0o700).create(&test_directory).unwrap();
+        let log_path = test_directory.join("a '$dollar`tick` %h.log");
+        std::fs::write(&log_path, "previous log\n").unwrap();
+        let literal_argument = "literal '$value`command` %h and spaces";
+        let mut terminal_command = Command::new("/bin/sh");
+        terminal_command.args(["-c", "printf '%s\\n%s\\n' \"$$\" \"$1\" >&2", "sh", literal_argument]);
+        let command_arguments = super::service_command_args(&terminal_command, &log_path, 239);
+        let terminal_process = Command::new(&command_arguments[0])
+            .args(&command_arguments[1..])
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let terminal_pid = terminal_process.id();
+        let process_output = terminal_process.wait_with_output().unwrap();
+        let log_contents = std::fs::read_to_string(&log_path).unwrap();
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::remove_dir(&test_directory).unwrap();
+        assert!(process_output.status.success(), "{process_output:?}");
+        assert!(process_output.stderr.is_empty(), "stderr must go to the log: {process_output:?}");
+        assert_eq!(log_contents, format!("previous log\n{terminal_pid}\n{literal_argument}\n"));
     }
 
     #[test]
@@ -451,15 +818,52 @@ mod tests {
     fn environment_file_and_directory_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let name = format!("hc-env-test-{}", super::super::random_hex());
-        let dir =
-            super::write_environment(Path::new("/var/tmp"), &name, &map(&[("API_KEY", "secret-canary")])).unwrap();
+        let dir = super::write_environment(&crate::test_tmp(), &name, &map(&[("API_KEY", "secret-canary")])).unwrap();
         let file = dir.join("environment");
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "API_KEY=\"secret-canary\"\n");
-        assert!(super::write_environment(Path::new("/var/tmp"), &name, &BTreeMap::new()).is_err());
+        assert!(super::write_environment(&crate::test_tmp(), &name, &BTreeMap::new()).is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "API_KEY=\"secret-canary\"\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manager_environment_decodes_busctl_strings_without_evaluating_values() {
+        let busctl_reply = br#"as 6 "EMPTY=" "PATH=/home/u/my tools" "SPECIAL=\"double\" \'single\' \\slash $dollar `ticks`=tail" "LINES=one\ntwo\r\tend" "UTF8=\303\251\342\230\203" "CONTROLS=\a\b\f\v\177""#;
+        let expected_environment = map(&[
+            ("EMPTY", ""),
+            ("PATH", "/home/u/my tools"),
+            ("SPECIAL", "\"double\" 'single' \\slash $dollar `ticks`=tail"),
+            ("LINES", "one\ntwo\r\tend"),
+            ("UTF8", "é☃"),
+            ("CONTROLS", "\x07\x08\x0c\x0b\x7f"),
+        ]);
+        let parsed_environment = super::parse_busctl_environment(busctl_reply);
+        assert_eq!(parsed_environment, Some(expected_environment));
+        assert_eq!(super::parse_busctl_environment(b"as 0\n"), Some(BTreeMap::new()));
+        let raw_utf8_reply = "as 1 \"UTF8=é☃\"".as_bytes();
+        assert_eq!(super::parse_busctl_environment(raw_utf8_reply), Some(map(&[("UTF8", "é☃")])));
+    }
+
+    #[test]
+    fn manager_environment_rejects_malformed_or_partial_replies() {
+        for malformed_reply in [
+            &b"s \"KEY=value\""[..],
+            b"as nope",
+            b"as 1",
+            b"as 1 \"KEY=unterminated",
+            b"as 2 \"KEY=only-one\"",
+            b"as 0 \"KEY=extra\"",
+            b"as 2 \"A=1\"\"B=2\"",
+            b"as 1 \"KEY=\\q\"",
+            b"as 1 \"KEY=\\40\"",
+            b"as 1 \"KEY=\\400\"",
+            b"as 1 \"KEY=\\300\"",
+            b"as 1 \"KEY=\\000\"",
+        ] {
+            assert_eq!(super::parse_busctl_environment(malformed_reply), None, "{malformed_reply:?}");
+        }
     }
 
     #[test]

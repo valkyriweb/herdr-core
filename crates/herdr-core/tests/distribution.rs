@@ -36,9 +36,25 @@ struct Releases {
 impl Releases {
     fn new(s: &Session, version: &str, targets: &[&str]) -> Releases {
         let root = s.root.join("releases");
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let url = format!("http://127.0.0.1:{port}");
-        let dir = root.join("core").join(version);
+        std::fs::create_dir_all(&root).unwrap();
+        let ready = root.join("server-port");
+        let server = Command::new("python3")
+            .arg(format!("{ROOT}/tests/releases_server.py"))
+            .arg(&ready)
+            .current_dir(&root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut r = Releases { root, url: String::new(), server };
+        let mut port = None;
+        wait_until("the releases site", || {
+            assert!(r.server.try_wait().unwrap().is_none(), "the releases site exited before becoming ready");
+            port = std::fs::read_to_string(&ready).ok().and_then(|text| text.parse::<u16>().ok());
+            port.is_some()
+        });
+        r.url = format!("http://127.0.0.1:{}", port.unwrap());
+        let dir = r.root.join("core").join(version);
         std::fs::create_dir_all(&dir).unwrap();
         let bin_dir = Path::new(BIN).parent().unwrap();
         for t in targets {
@@ -78,7 +94,7 @@ impl Releases {
         }
         let out = Command::new(format!("{ROOT}/../../scripts/manifest"))
             .arg(&dir)
-            .env("RELEASES_URL", &url)
+            .env("RELEASES_URL", &r.url)
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -88,16 +104,7 @@ impl Releases {
             .replace(&format!("\"version\": \"{THIS}\""), &format!("\"version\": \"{version}\""))
             .replace(&format!("/core/{THIS}/"), &format!("/core/{version}/"));
         std::fs::write(dir.join("manifest.json"), &manifest).unwrap();
-        std::fs::write(root.join("core/latest.json"), &manifest).unwrap();
-        let server = Command::new("python3")
-            .args(["-m", "http.server", "--bind", "127.0.0.1", &port.to_string()])
-            .current_dir(&root)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let r = Releases { root, url, server };
-        wait_until("the releases site", || std::net::TcpStream::connect(r.url.trim_start_matches("http://")).is_ok());
+        std::fs::write(r.root.join("core/latest.json"), &manifest).unwrap();
         r
     }
 }
@@ -244,6 +251,51 @@ fn bundle_completion_skips_releases_without_a_bundle() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert!(!bin.exists(), "no binary swap or restart for a pre-bundle release");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_install_script_installs_when_the_temp_dir_cannot_execute() {
+    // The bug, reproduced as it happens on a host with a noexec /tmp: the
+    // installer downloads and extracts fine, but the first `--version`
+    // check is refused by the mount (EACCES). It must stage the binary on
+    // the destination filesystem and install, not cry "wrong machine".
+    let s = Session::new();
+    let r = Releases::new(&s, THIS, &[&here()]);
+    let bin = s.root.join("bin");
+    let tmp = s.root.join("noexec-tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    // The runner may forbid user namespaces (hardened CI): probe with a
+    // no-op before relying on it, and skip when unprivileged mounting is out.
+    let probe = Command::new("unshare").args(["-rm", "--map-root-user", "true"]).output().unwrap();
+    if !probe.status.success() {
+        return;
+    }
+    // Root inside a fresh mount namespace: a noexec tmpfs for TMPDIR, the
+    // install dir on a normal filesystem. (Root cannot bypass noexec: the
+    // refusal is a mount flag, not a permission bit.)
+    let script = format!(
+        "set -e; mount --make-rprivate /; mount -t tmpfs -o size=256M,noexec tmpfs {}; \
+         export TAR_OPTIONS=--no-same-owner; \
+         export HC_INSTALL_DIR={} TMPDIR={} HERDR_RELEASES_URL={}; \
+         /usr/bin/sh {}/../../distribution/install.sh; \
+         /usr/bin/sh {}/../../distribution/install.sh",
+        tmp.display(),
+        bin.display(),
+        tmp.display(),
+        r.url,
+        ROOT,
+        ROOT
+    );
+    let out = s.program("unshare").args(["-rm", "--map-root-user", "sh", "-c", &script]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("does not run"), "the noexec mount was read as a wrong machine: {stdout}{stderr}");
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("installed"));
+    assert!(stdout.contains("updated"));
+    assert!(bin.join("herdr-core").is_file());
+    assert!(!bin.join("herdr-core.staged").exists(), "the stage is cleaned up");
 }
 
 #[cfg(target_os = "macos")]

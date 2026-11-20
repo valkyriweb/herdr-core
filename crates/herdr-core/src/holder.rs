@@ -30,8 +30,6 @@ struct Term {
     /// Since when its output could drain; None while its reader waits for a
     /// core that fell behind. An exit waits for its output from then on.
     drains_since: Option<Instant>,
-    /// Its `HC_SCOPE` token: what it started carries it too.
-    scope: Option<String>,
 }
 
 /// The connected core. Frames go out through its own writer thread: a core
@@ -77,6 +75,7 @@ struct State {
 }
 
 struct Holder {
+    login_session: Option<platform::LoginSession>,
     state: Mutex<State>,
     changed: Condvar,
     instance: String,
@@ -85,12 +84,12 @@ struct Holder {
     socket: std::path::PathBuf,
     /// A newer build took over: exit once the last terminal is gone.
     draining: std::sync::atomic::AtomicBool,
-    /// Sweeps still ending what a finished program left behind.
-    sweeps: std::sync::atomic::AtomicUsize,
 }
 
 /// Runs a holder on `socket` (each holder has its own; the core picks the path).
 pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
+    let login_session = platform::login_session();
+    platform::prepare_holder();
     platform::raise_nofile_limit();
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     paths.create_dirs()?;
@@ -101,6 +100,7 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
         .and_then(|v| v.parse().ok())
         .map_or(Duration::from_secs(3), Duration::from_millis);
     let holder = Arc::new(Holder {
+        login_session,
         state: Mutex::new(State {
             terms: HashMap::new(),
             core: None,
@@ -115,7 +115,6 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
         paths,
         socket,
         draining: Default::default(),
-        sweeps: Default::default(),
     });
     let supervisor = holder.clone();
     std::thread::spawn(move || supervisor.supervise());
@@ -134,27 +133,7 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
 impl Holder {
     fn exit(&self) -> ! {
         platform::remove_endpoint(&self.socket);
-        // Never leave with leftovers still being ended: nobody else would.
-        self.wait_for_sweeps();
         std::process::exit(0);
-    }
-
-    fn wait_for_sweeps(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while self.sweeps.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    /// Ends everything carrying `scope`, in the background.
-    fn sweep(self: &Arc<Self>, scope: Option<String>) {
-        let Some(scope) = scope else { return };
-        self.sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let holder = self.clone();
-        std::thread::spawn(move || {
-            crate::sweep::sweep(&[scope]);
-            holder.sweeps.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        });
     }
 
     fn exit_if_drained(&self) {
@@ -221,6 +200,8 @@ impl Holder {
                 instance: self.instance.clone(),
                 pid: std::process::id(),
                 build: crate::client::build_id(),
+                login_session: self.login_session,
+                draining: self.draining.load(std::sync::atomic::Ordering::SeqCst),
                 previous: st.previous.into(),
                 terminals: ids
                     .iter()
@@ -309,13 +290,11 @@ impl Holder {
                         st.terms.values_mut().for_each(|t| t.tail.clear());
                     }
                     if mode == Goodbye::Shutdown {
-                        // Whatever the core's stop missed (started since, or hiding) ends
-                        // here, before the goodbye: the stop returns when all is gone.
-                        let scopes: Vec<Option<String>> = st.terms.values().map(|t| t.scope.clone()).collect();
-                        drop(st);
-                        scopes.into_iter().for_each(|scope| self.sweep(scope));
-                        self.wait_for_sweeps();
-                        let mut st = self.lock();
+                        // A spawn may have completed after the core gave up waiting.
+                        // End its program and foreground job, not detached descendants.
+                        for t in st.terms.values().filter(|t| t.exit.is_none()) {
+                            t.pty.signal(t.pid, crate::platform::signal::KILL);
+                        }
                         self.to_core(&mut st, &proto::frame(proto::BYE, 0, &[]));
                         let backlog = st.core.as_ref().map(|c| c.backlog.clone());
                         drop(st);
@@ -340,12 +319,20 @@ impl Holder {
             let frame = proto::json_frame(proto::SPAWNED, id, &proto::Spawned { pid: t.pid });
             return self.to_core(&mut st, &frame);
         }
+        if self.draining.load(std::sync::atomic::Ordering::SeqCst) {
+            let frame = proto::json_frame(
+                proto::SPAWN_FAILED,
+                id,
+                &proto::SpawnFailed { error: "holder is draining; start a terminal through the current core".into() },
+            );
+            return self.to_core(&mut st, &frame);
+        }
         let started = platform::spawn_pty(&spec.argv, &spec.env, &spec.cwd, spec.cols, spec.rows)
             .and_then(|(pty, child)| Ok((pty.reader()?, pty.writer()?, pty, child)));
         let frame = match started {
             Err(e) => {
                 let error = format!("cannot start {:?}: {e}", spec.argv.first().map_or("", |s| s.as_str()));
-                eprintln!("holder: {}: {error}", crate::terminals::address(id));
+                let _ = writeln!(io::stderr(), "holder: {}: {error}", crate::terminals::address(id));
                 proto::json_frame(proto::SPAWN_FAILED, id, &proto::SpawnFailed { error })
             }
             Ok((reader, mut writer, pty, child)) => {
@@ -370,13 +357,11 @@ impl Holder {
                         exit: None,
                         reader_done: false,
                         drains_since: Some(Instant::now()),
-                        scope: spec.env.get(crate::sweep::VAR).cloned(),
                     },
                 );
                 let (holder, waiter) = (self.clone(), self.clone());
-                let scope = spec.env.get(crate::sweep::VAR).cloned();
                 std::thread::spawn(move || holder.pump(id, reader));
-                std::thread::spawn(move || waiter.reap(id, child, scope));
+                std::thread::spawn(move || waiter.reap(id, child));
                 proto::json_frame(proto::SPAWNED, id, &proto::Spawned { pid })
             }
         };
@@ -418,8 +403,7 @@ impl Holder {
     }
 
     /// The exit code comes from here, after the last output has been forwarded.
-    /// `scope` is its own copy: the terminal may be released (forgotten) first.
-    fn reap(self: &Arc<Self>, id: u32, mut child: Process, scope: Option<String>) {
+    fn reap(self: &Arc<Self>, id: u32, mut child: Process) {
         let (code, signal) = match platform::wait(&mut child) {
             Ok(ended) => ended,
             Err(e) => {
@@ -428,14 +412,6 @@ impl Holder {
             }
         };
         let exit = Exit { code, signal };
-        // The terminal lived exactly as long as its program: what it left behind
-        // goes too, before the exit is reported. If we die first, the core still
-        // sees it live and ends what carries its scope itself.
-        if let Some(scope) = scope {
-            self.sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            crate::sweep::sweep(&[scope]);
-            self.sweeps.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
         let exited = Instant::now();
         let mut st = self.lock();
         while let Some(t) = st.terms.get(&id).filter(|t| !t.reader_done) {
@@ -477,8 +453,12 @@ impl Holder {
             st.restarts.push(now);
             st.core_left = now;
             drop(st);
+            if !platform::holder_can_start_core(self.login_session) {
+                let _ = writeln!(io::stderr(), "holder: original GUI login unavailable; waiting for a fresh launcher");
+                continue;
+            }
             if let Err(e) = crate::client::spawn_core(&self.paths) {
-                eprintln!("holder: cannot start core: {e:?}");
+                let _ = writeln!(io::stderr(), "holder: cannot start core: {e:?}");
             }
         }
     }
