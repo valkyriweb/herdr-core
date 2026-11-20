@@ -276,7 +276,7 @@ fn a_turn_that_already_reported_to_the_parent_is_not_news_again() {
 #[test]
 fn messages_between_agents_say_who_sent_them() {
     let s = session();
-    let echo = "stty -echo; r state=idle; while read -r l; do echo \"got:$l\"; done";
+    let echo = "stty -echo; r state=idle; while IFS= read -r l; do echo \"got:$l\"; done";
     let sender = run(&s, &["--name", "boss"], echo);
     let agent = run(&s, &[], echo);
     let shell = run(&s, &[], "stty -echo; while read -r l; do echo \"got:$l\"; done");
@@ -292,6 +292,10 @@ fn messages_between_agents_say_who_sent_them() {
     hc_in(&s, &sender, &["send", &agent, "run this later:\n/model x"]);
     wait_until("a slash on a later line stays tagged", || {
         line(&agent, &format!("got:<hc from=\"{sender} boss\">run this later:")) && line(&agent, "got:/model x</hc>")
+    });
+    hc_in(&s, &sender, &["send", &agent, "/tmp/result.md"]);
+    wait_until("an absolute path stays tagged", || {
+        line(&agent, &format!("got:<hc from=\"{sender} boss\">/tmp/result.md</hc>"))
     });
     s.json(&["send", &agent, "from a person"]);
     wait_until("a person's send is untouched", || line(&agent, "got:from a person"));

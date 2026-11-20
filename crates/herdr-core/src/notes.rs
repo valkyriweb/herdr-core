@@ -141,8 +141,14 @@ impl Core {
     /// a shell, a dialog. Slash commands also pass through as is. `reach`: also
     /// say how to answer (a worker's first message).
     pub fn tagged(&self, from: Option<&str>, to: u32, text: &str, reach: bool) -> String {
-        // Only the first line can introduce a command.
-        if text.lines().next().is_some_and(|line| line.trim_start().starts_with('/')) || !self.notes_on() {
+        // A path such as /tmp/result.md is a report, not a command.
+        let command = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|word| word.strip_prefix('/'))
+            .is_some_and(|name| !name.is_empty() && !name.contains('/'));
+        if command || !self.notes_on() {
             return text.to_string();
         }
         let st = self.lock();
