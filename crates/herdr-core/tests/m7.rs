@@ -310,7 +310,7 @@ fn a_template_starts_its_command_and_sends_body_and_prompt_first() {
 #[test]
 fn an_agent_starting_a_worker_tells_it_who_asked_and_how_to_answer() {
     let s = session();
-    template(&s, "reviewer", &format!("---\ndescription: r\ncommand: {ECHO_AGENT}\n---\n"));
+    template(&s, "reviewer", &format!("---\ndescription: r\ncommand: {ECHO_AGENT}\n---\nYou review code.\n"));
     let boss =
         s.json(&["run", "--bg", "--name", "boss", "sh", "-c", r#"printf '\033]7501;state=idle\033\\'; sleep 100"#]);
     let boss = boss["address"].as_str().unwrap().to_string();
@@ -318,8 +318,11 @@ fn an_agent_starting_a_worker_tells_it_who_asked_and_how_to_answer() {
     let out = s.cmd().env("HC_TERMINAL_ID", &boss).args(["run", "--bg", "reviewer", "/model x"]).output().unwrap();
     let t: Value = serde_json::from_slice(&out.stdout).unwrap();
     let t = t["address"].as_str().unwrap().to_string();
-    let want = format!("got:<hc from=\"{boss} boss\" reach=\"hc send {boss} when done or stuck\">/model x</hc>");
-    wait_until("tagged first message", || text(&s, &t).contains(&want));
+    let open = format!("got:<hc from=\"{boss} boss\" reach=\"hc send {boss} when done or stuck\">You review code.");
+    wait_until("the reach tag covers the template body and slash prompt", || {
+        let text = text(&s, &t);
+        text.contains(&open) && text.contains("got:/model x</hc>")
+    });
 }
 
 #[test]
