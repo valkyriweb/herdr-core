@@ -127,15 +127,15 @@ hc run --bg --on cbx-0123456789ab --label herdr.space=workspace -- pi
 crabbox stop --provider serve --id cbx_0123456789ab
 ```
 
-The helper prints the machine name. It uses Crabbox's lease SSH route and lets
-hc install the remote core if needed. Pi must already be installed in the
-lease. Neither the helper nor hc copies local agent credentials.
+The helper prints the machine name and uses Crabbox's lease SSH route. It
+runs `hc machine add --install` to install the remote core if needed. Install
+Pi in the lease before starting the terminal. Neither tool copies local agent
+credentials.
 
-If a gVisor lease reports `Permission denied` when starting a terminal, check
-`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. If the mode is `620`,
-restore directory traversal **inside that lease only** with
-`hc exec --on cbx-0123456789ab -- sudo -n chmod 0755 /dev/pts`.
-Do not change the donor host.
+On gVisor donors, the lease must let unprivileged users traverse `/dev/pts`.
+If `hc run` reports `Permission denied`, check the guest directory mode with
+`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. Mode `620` means the
+donor needs the Crabbox guest bootstrap fix. Do not change the host mount.
 
 The machine is not marked `--temp` so Herdr can display its terminals. Set
 `herdr.space` to an ID on the lease machine, not an ID from a different machine.
