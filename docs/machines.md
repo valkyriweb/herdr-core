@@ -108,6 +108,43 @@ hc machine add --name my-box --temp --install --via '/path/to/vercel-sandbox.py 
 hc run --bg --on my-box --cwd /vercel/app npm run build
 ```
 
+### Crabbox serve lease
+
+On macOS or Linux with Python 3.8 or later, install [the Crabbox helper](via/crabbox.py)
+from this checkout. Keep it at a stable path: hc uses it to reconnect.
+
+```sh
+install -m 755 docs/via/crabbox.py ~/.local/bin/hc-crabbox
+```
+
+Run it from the checkout that owns the lease, with hc already running and
+`hc` and `crabbox` on PATH. Pass the canonical lease ID, not its reusable slug:
+
+```sh
+crabbox warmup --provider serve --type cpu2 --slug my-task
+~/.local/bin/hc-crabbox add cbx_0123456789ab
+hc run --bg --on cbx-0123456789ab --label herdr.space=workspace -- pi
+crabbox stop --provider serve --id cbx_0123456789ab
+```
+
+The helper prints the machine name. It uses Crabbox's lease SSH route and lets
+hc install the remote core if needed. Pi must already be installed in the
+lease. Neither the helper nor hc copies local agent credentials.
+
+If a gVisor lease reports `Permission denied` when starting a terminal, check
+`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. If the mode is `620`,
+restore directory traversal **inside that lease only** with
+`hc exec --on cbx-0123456789ab -- sudo -n chmod 0755 /dev/pts`.
+Do not change the donor host.
+
+The machine is not marked `--temp` so Herdr can display its terminals. Set
+`herdr.space` to an ID on the lease machine, not an ID from a different machine.
+When the line drops, hc tries again. If Crabbox confirms the lease ended,
+the helper removes its local machine entry. An unreachable broker does not
+remove the entry. A running machine connection does not extend the lease
+lifetime. Keep the helper and the owning checkout in place while the lease
+lives.
+
 ## What runs where
 
 Your local core keeps the machine connection and combines terminal lists and events.
