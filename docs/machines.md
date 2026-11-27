@@ -108,6 +108,44 @@ hc machine add --name my-box --temp --install --via '/path/to/vercel-sandbox.py 
 hc run --bg --on my-box --cwd /vercel/app npm run build
 ```
 
+### Crabbox serve lease
+
+On macOS or Linux with Python 3.8 or later, install [the Crabbox helper](via/crabbox.py)
+from this checkout. Keep it at a stable path: hc uses it to reconnect.
+
+```sh
+install -m 755 docs/via/crabbox.py ~/.local/bin/hc-crabbox
+```
+
+Run it from the checkout that owns the lease, with hc already running and
+`hc` and `crabbox` on PATH. Pass the canonical lease ID, not its reusable slug:
+
+```sh
+crabbox warmup --provider serve --type cpu2 --slug my-task
+~/.local/bin/hc-crabbox add cbx_0123456789ab
+hc run --bg --on cbx-0123456789ab --label herdr.space=workspace -- pi
+crabbox stop --provider serve --id cbx_0123456789ab
+```
+
+The helper prints the machine name and uses Crabbox's lease SSH route. It
+runs `hc machine add --install` to install the remote core if needed. Install
+Pi in the lease before starting the terminal. Neither tool copies local agent
+credentials.
+
+On gVisor donors, the lease must let unprivileged users traverse `/dev/pts`.
+If `hc run` reports `Permission denied`, check the guest directory mode with
+`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. If the mode is `620`,
+update the donor to a gVisor release that creates `/dev/pts` with mode `755`
+(for example, `20261123.1`), then try a new lease. Do not change the host mount.
+
+The machine is not marked `--temp` so Herdr can display its terminals. Set
+`herdr.space` to an ID on the lease machine, not an ID from a different machine.
+When the line drops, hc tries again. If Crabbox confirms the lease ended,
+the helper removes its local machine entry. An unreachable broker does not
+remove the entry. A running machine connection does not extend the lease
+lifetime. Keep the helper and the owning checkout in place while the lease
+lives.
+
 ## What runs where
 
 Your local core keeps the machine connection and combines terminal lists and events.
