@@ -134,8 +134,9 @@ credentials.
 
 On gVisor donors, the lease must let unprivileged users traverse `/dev/pts`.
 If `hc run` reports `Permission denied`, check the guest directory mode with
-`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. Mode `620` means the
-donor needs the Crabbox guest bootstrap fix. Do not change the host mount.
+`hc exec --on cbx-0123456789ab -- stat -c %a /dev/pts`. If the mode is `620`,
+update the donor to a gVisor release that creates `/dev/pts` with mode `755`
+(for example, `20261123.1`), then try a new lease. Do not change the host mount.
 
 The machine is not marked `--temp` so Herdr can display its terminals. Set
 `herdr.space` to an ID on the lease machine, not an ID from a different machine.
